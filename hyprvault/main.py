@@ -42,6 +42,7 @@ def print_help():
     print(f"  {GREEN}list{RESET}    List all saved sessions.")
     print(f"  {GREEN}delete{RESET}  Delete a saved session.")
     print(f"  {GREEN}gui{RESET}     Choose a session in Walker and restore it.")
+    print(f"  {GREEN}gui-save{RESET} Save a session from Walker.")
     print(f"  {GREEN}help{RESET}    Show this magnificent help message.")
 
     print(f"\n{BOLD}EXAMPLES:{RESET}")
@@ -58,6 +59,9 @@ def print_help():
     print(
         f"  hyprvault {GREEN}gui{RESET}                -> Opens Walker to choose a session"
     )
+    print(
+        f"  hyprvault {GREEN}gui-save{RESET}           -> Opens Walker to enter a session name"
+    )
 
     print(f"\n{BOLD}SESSION DIR:{RESET} {get_config_dir()}")
     print(
@@ -65,14 +69,7 @@ def print_help():
     )
 
 
-def choose_session_with_walker():
-    sessions = list_sessions()
-    if not sessions:
-        subprocess.run(
-            ["notify-send", "HyprVault", "No saved sessions"], check=False
-        )
-        return None
-
+def choose_with_walker(options, prompt):
     if not shutil.which("walker"):
         print(f"{RED}Walker is not installed.{RESET}")
         return None
@@ -86,15 +83,45 @@ def choose_session_with_walker():
             "-t",
             "pi",
             "-p",
-            "Load HyprVault session",
+            prompt,
         ],
-        input="\n".join(sessions) + "\n",
+        input=("\n".join(options) + "\n") if options else "",
         text=True,
         capture_output=True,
     )
 
     choice = proc.stdout.strip()
     return choice or None
+
+
+
+def choose_session_with_walker():
+    sessions = list_sessions()
+    if not sessions:
+        subprocess.run(
+            ["notify-send", "HyprVault", "No saved sessions"], check=False
+        )
+        return None
+
+    return choose_with_walker(sessions, "Load HyprVault session")
+
+
+
+def choose_restore_mode_with_walker():
+    return choose_with_walker(
+        ["Replace current windows", "Keep current windows", "Delete session"],
+        "How should this session load?",
+    )
+
+
+
+def choose_yes_no_with_walker(prompt):
+    return choose_with_walker(["Yes", "No"], prompt)
+
+
+
+def choose_session_name_with_walker():
+    return choose_with_walker([], "Save HyprVault session")
 
 
 async def main():
@@ -107,7 +134,7 @@ async def main():
     parser.add_argument(
         "action",
         nargs="?",
-        choices=["save", "load", "list", "delete", "gui", "help"],
+        choices=["save", "load", "list", "delete", "gui", "gui-save", "help"],
         help="Action to be performed",
     )
     parser.add_argument("name", nargs="?", default="last_session", help="Session name")
@@ -135,11 +162,39 @@ async def main():
     elif args.action == "gui":
         chosen = choose_session_with_walker()
         if chosen:
+            mode = choose_restore_mode_with_walker()
+            if not mode:
+                return
+
+            if mode == "Delete session":
+                confirm = choose_yes_no_with_walker(f"Delete session '{chosen}'?")
+                if confirm == "Yes":
+                    delete_session(chosen)
+                return
+
+            clean = mode == "Replace current windows"
             print(f"{BLUE}[*]{RESET} Loading session: {BOLD}{chosen}{RESET}...")
             try:
-                await restore_session(chosen)
+                await restore_session(chosen, clean=clean)
             except Exception as e:
                 print(f"{RED}[-]{RESET} Session load error: {e}")
+
+    elif args.action == "gui-save":
+        name = choose_session_name_with_walker()
+        if name:
+            overwrite = None
+            if name in list_sessions():
+                confirm = choose_yes_no_with_walker(f"Overwrite session '{name}'?")
+                if confirm != "Yes":
+                    save_session(name, overwrite=False)
+                    return
+                overwrite = True
+
+            print(f"{YELLOW}[*]{RESET} Saving session: {BOLD}{name}{RESET}...")
+            try:
+                save_session(name, overwrite=overwrite)
+            except Exception as e:
+                print(f"{RED}[-]{RESET} An error occurred: {e}")
 
     elif args.action == "list":
         sessions = list_sessions()

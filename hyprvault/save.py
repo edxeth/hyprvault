@@ -47,7 +47,7 @@ class WindowState:
         )
 
 
-def save_session(name="last_session"):
+def save_session(name="last_session", overwrite=None):
     try:
         output = subprocess.check_output(["hyprctl", "clients", "-j"], text=True)
         data = json.loads(output)
@@ -68,7 +68,10 @@ def save_session(name="last_session"):
             state.command = launcher_cmd
             state.match_command = launcher_cmd
 
-            if state.class_name and is_terminal_emulator(state.class_name):
+            if state.class_name == "Docker Desktop":
+                state.command = "/usr/local/bin/docker desktop start"
+                state.match_command = ""
+            elif state.class_name and is_terminal_emulator(state.class_name):
                 leaf_argv = leaf_cmdline(pid)
                 if leaf_argv:
                     leaf_exe = Path(leaf_argv[0]).name
@@ -82,15 +85,20 @@ def save_session(name="last_session"):
 
     session_path = get_session_path(name)
     if Path(session_path).exists():
-        print(f"{YELLOW}[!]{RESET} Session already exists: {session_path}")
-        print(f"{YELLOW}[!]{RESET} Do you want to overwrite it? (y/n)", end=" ")
-        if input().lower() != "y":
+        if overwrite is False:
             print(f"{YELLOW}[!]{RESET} Cancelled.")
             return
+        if overwrite is None:
+            print(f"{YELLOW}[!]{RESET} Session already exists: {session_path}")
+            print(f"{YELLOW}[!]{RESET} Do you want to overwrite it? (y/n)", end=" ")
+            if input().lower() != "y":
+                print(f"{YELLOW}[!]{RESET} Cancelled.")
+                return
 
     with open(session_path, "w", encoding="utf-8") as f:
         json.dump([asdict(w) for w in windows], f, indent=4)
     print(f"{GREEN}[+]{RESET} Session saved to: {session_path}")
+    subprocess.run(["notify-send", "HyprVault", f"Session saved: {name}"], check=False)
 
 
 if __name__ == "__main__":

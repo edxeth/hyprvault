@@ -320,6 +320,8 @@ async def restore_window(sw, matchable_clients, used_addresses: set):
         rules += ";tile"
 
     cmd = normalize_command_string(sw.get("command", ""))
+    if sw.get("class_name") == "Docker Desktop":
+        cmd = "/usr/local/bin/docker desktop start"
     if cmd:
         live_clients = await get_clients()
         existing_addresses = {
@@ -346,7 +348,30 @@ async def restore_window(sw, matchable_clients, used_addresses: set):
     return None, None
 
 
-async def restore_session(name="last_session"):
+async def close_windows_on_workspaces(workspace_ids, timeout=10.0):
+    workspace_ids = set(workspace_ids)
+    attempts = max(1, int(timeout / 0.2))
+
+    for _ in range(attempts):
+        clients = await get_clients()
+        targets = [
+            client
+            for client in clients
+            if client.get("workspace", {}).get("id") in workspace_ids
+        ]
+        if not targets:
+            return
+
+        for client in targets:
+            addr = client.get("address")
+            if addr:
+                await dispatch(["closewindow", f"address:{addr}"])
+                await asyncio.sleep(0.05)
+
+        await asyncio.sleep(0.2)
+
+
+async def restore_session(name="last_session", clean=False):
     session_path = get_session_path(name)
 
     try:
@@ -357,7 +382,6 @@ async def restore_session(name="last_session"):
         return
 
     await init_hypr_config()
-    matchable_clients = await get_clients()
 
     workspace_order = []
     grouped_windows = {}
@@ -367,6 +391,12 @@ async def restore_session(name="last_session"):
             grouped_windows[ws_id] = []
             workspace_order.append(ws_id)
         grouped_windows[ws_id].append(sw)
+
+    if clean:
+        await close_windows_on_workspaces(workspace_order)
+        matchable_clients = []
+    else:
+        matchable_clients = await get_clients()
 
     used_addresses: set[str] = set()
     focus_candidates = []
