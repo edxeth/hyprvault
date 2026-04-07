@@ -84,6 +84,27 @@ Each session captures:
 1. **Save**: Uses `hyprctl clients -j` to get window info, reads `/proc/{pid}/cmdline` for commands
 2. **Load**: Matches existing windows by class name, moves them to saved workspaces, or spawns new ones
 
+## 🧪 Restore Tracing
+
+For debugging tricky restore issues, you can enable a detailed action trace for a single run:
+
+```bash
+HYPRVAULT_TRACE_ACTIONS=1 hyprvault load my_workspace
+```
+
+Optional custom trace path:
+
+```bash
+HYPRVAULT_TRACE_ACTIONS=1 HYPRVAULT_TRACE_PATH=/tmp/hyprvault-trace.log hyprvault load my_workspace
+```
+
+The trace records workspace switches, focus attempts, spawn attempts, deferred restores, and final focus decisions.
+Default trace path:
+
+```bash
+/tmp/hyprvault-action-trace.log
+```
+
 ## 🤝 Contributing
 
 Contributions welcome! Feel free to open issues or PRs.

@@ -33,6 +33,17 @@ def get_session_path(name: str) -> Path:
 
 TERMINAL_EMULATORS = {"ghostty"}
 SHELL_EXECUTABLES = {"bash", "dash", "fish", "nu", "sh", "tcsh", "xonsh", "zsh"}
+DOCKER_DESKTOP_OPEN_COMMAND = (
+    "/bin/sh -lc '"
+    "/usr/local/bin/docker desktop start >/dev/null 2>&1 || true; "
+    "(i=0; "
+    "while [ \"$i\" -lt 20 ]; do "
+    "/usr/local/bin/docker desktop status 2>/dev/null | grep -q \"^Status[[:space:]]*running$\" && "
+    "exec \"/opt/docker-desktop/Docker Desktop\" --reason=open-tray --analytics-enabled=false --name=dashboard; "
+    "i=$((i+1)); "
+    "sleep 1; "
+    "done) >/dev/null 2>&1 &'"
+)
 
 
 def _strip_outer_quotes(value: str) -> str:

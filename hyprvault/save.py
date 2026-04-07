@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import List
 
 from .utils import (
+    DOCKER_DESKTOP_OPEN_COMMAND,
     GREEN,
     RESET,
     SHELL_EXECUTABLES,
@@ -69,7 +70,7 @@ def save_session(name="last_session", overwrite=None):
             state.match_command = launcher_cmd
 
             if state.class_name == "Docker Desktop":
-                state.command = "/usr/local/bin/docker desktop start"
+                state.command = DOCKER_DESKTOP_OPEN_COMMAND
                 state.match_command = ""
             elif state.class_name and is_terminal_emulator(state.class_name):
                 leaf_argv = leaf_cmdline(pid)

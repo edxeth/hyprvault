@@ -1,15 +1,45 @@
 import asyncio
 import collections
 import json
+import os
 import shlex
+import time
 from pathlib import Path
 
-from .utils import GREEN, RED, RESET, YELLOW, TERMINAL_EMULATORS, format_cmdline, get_session_path, leaf_cmdline, normalize_command_string, read_cmdline
+from .utils import (
+    DOCKER_DESKTOP_OPEN_COMMAND,
+    GREEN,
+    RED,
+    RESET,
+    TERMINAL_EMULATORS,
+    YELLOW,
+    format_cmdline,
+    get_session_path,
+    leaf_cmdline,
+    normalize_command_string,
+    read_cmdline,
+)
 
 HYPR_V = 0.0
+# Enable restore tracing with HYPRVAULT_TRACE_ACTIONS=1.
+# Optional: override the log file path with HYPRVAULT_TRACE_PATH.
+TRACE_ENV_VAR = "HYPRVAULT_TRACE_ACTIONS"
+TRACE_ENABLED = os.environ.get(TRACE_ENV_VAR, "").lower() in {"1", "true", "yes", "on"}
+TRACE_PATH = Path(os.environ.get("HYPRVAULT_TRACE_PATH", "/tmp/hyprvault-action-trace.log"))
+
+
+def trace(message):
+    if not TRACE_ENABLED:
+        return
+
+    TRACE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    timestamp = time.strftime("%H:%M:%S")
+    with TRACE_PATH.open("a", encoding="utf-8") as f:
+        f.write(f"[{timestamp}] {message}\n")
 
 
 async def dispatch(cmd_args, wait=True):
+    trace(f"dispatch wait={wait} args={cmd_args}")
     proc = await asyncio.create_subprocess_exec(
         "hyprctl",
         "dispatch",
@@ -56,12 +86,15 @@ async def get_active_window_address():
 
 
 async def focus_window(addr, timeout=1.0):
+    trace(f"focus_window start addr={addr} timeout={timeout}")
     await dispatch(["focuswindow", f"address:{addr}"])
     attempts = max(1, int(timeout / 0.05))
     for _ in range(attempts):
         if await get_active_window_address() == addr:
+            trace(f"focus_window success addr={addr}")
             return True
         await asyncio.sleep(0.05)
+    trace(f"focus_window failed addr={addr}")
     return False
 
 
@@ -112,6 +145,20 @@ async def wait_for_spawned_window(sw, existing_addresses: set[str], timeout=6.0)
             if not addr or addr in existing_addresses:
                 continue
             if client_matches_saved_window(client, sw):
+                return client
+        await asyncio.sleep(0.1)
+    return None
+
+
+async def wait_for_spawned_class_window(class_name, existing_addresses: set[str], timeout=6.0):
+    attempts = max(1, int(timeout / 0.1))
+    for _ in range(attempts):
+        clients = await get_clients()
+        for client in clients:
+            addr = client.get("address")
+            if not addr or addr in existing_addresses:
+                continue
+            if class_matches_saved_window(client.get("class"), class_name):
                 return client
         await asyncio.sleep(0.1)
     return None
@@ -234,7 +281,44 @@ def order_tiled_windows(saved_windows):
 
 
 def is_late_prone_window(sw):
-    return sw.get("class_name") == "Docker Desktop"
+    if sw.get("class_name") == "Docker Desktop":
+        return True
+
+    cmd = normalize_command_string(sw.get("match_command") or sw.get("command", ""))
+    return "electron" in cmd
+
+
+
+def spawned_window_timeout(sw):
+    if sw.get("class_name") == "Docker Desktop":
+        return 12.0
+
+    normalized_class = (sw.get("class_name") or "").lower().rsplit(".", 1)[-1]
+    if normalized_class in TERMINAL_EMULATORS:
+        return 12.0
+
+    return 30.0 if is_late_prone_window(sw) else 6.0
+
+
+
+def needs_tiled_stabilization(sw):
+    return is_late_prone_window(sw) and sw.get("class_name") != "Docker Desktop"
+
+
+
+def client_matches_saved_placement(client, sw):
+    return (
+        client.get("workspace", {}).get("id") == sw["workspace_id"]
+        and client.get("at") == sw.get("at")
+        and client.get("size") == sw.get("size")
+    )
+
+
+
+def stabilization_observe_window(sw):
+    if is_late_prone_window(sw) and sw.get("class_name") != "Docker Desktop":
+        return 4.5
+    return 0.0
 
 
 
@@ -314,9 +398,9 @@ async def apply_window_state(sw, addr, current_fullscreen=0, move_workspace=True
         await dispatch(["fullscreen", str(saved_fs_state)])
 
 
-async def restore_window(sw, matchable_clients, used_addresses: set):
+async def restore_window(sw, matchable_clients, used_addresses: set, force_spawn=False):
     ws_id = sw["workspace_id"]
-    match = find_best_match(sw, matchable_clients, used_addresses)
+    match = None if force_spawn else find_best_match(sw, matchable_clients, used_addresses)
 
     if match:
         await asyncio.sleep(0.15)
@@ -340,6 +424,7 @@ async def restore_window(sw, matchable_clients, used_addresses: set):
 
     if match:
         addr = match["address"]
+        trace(f"restore_window reuse class={sw.get('class_name')} ws={ws_id} addr={addr}")
         used_addresses.add(addr)
         await apply_window_state(sw, addr, match.get("fullscreen", 0))
         return addr, sw.get("focus_history_id", 999)
@@ -352,19 +437,38 @@ async def restore_window(sw, matchable_clients, used_addresses: set):
 
     cmd = normalize_command_string(sw.get("command", ""))
     if sw.get("class_name") == "Docker Desktop":
-        cmd = "/usr/local/bin/docker desktop start"
+        cmd = normalize_command_string(DOCKER_DESKTOP_OPEN_COMMAND)
     if cmd:
+        closed_addresses = set()
+        if force_spawn:
+            closed_addresses = await close_live_matches(sw, workspace_id=ws_id)
         live_clients = await get_clients()
         existing_addresses = {
-            client.get("address") for client in live_clients if client.get("address")
+            client.get("address")
+            for client in live_clients
+            if client.get("address") and client.get("address") not in closed_addresses
         }
+        trace(f"restore_window spawn class={sw.get('class_name')} ws={ws_id} force_spawn={force_spawn} cmd={cmd}")
         print(f"{YELLOW}[*]{RESET} Spawning new window: {cmd}")
         proc = await asyncio.create_subprocess_exec(
             "hyprctl", "dispatch", "exec", f"[{rules}]", cmd
         )
         await proc.wait()
-        spawned_match = await wait_for_spawned_window(sw, existing_addresses)
+        if sw.get("class_name") == "Docker Desktop":
+            spawned_match = await wait_for_spawned_class_window(
+                sw.get("class_name"),
+                existing_addresses,
+                timeout=6.0,
+            )
+        else:
+            spawned_match = await wait_for_spawned_window(
+                sw,
+                existing_addresses,
+                timeout=spawned_window_timeout(sw),
+            )
         if spawned_match:
+            trace(f"restore_window spawned class={sw.get('class_name')} ws={ws_id} addr={spawned_match.get('address')} spawned_ws={spawned_match.get('workspace', {}).get('id')}")
+            spawned_match = await stabilize_spawned_window(sw, spawned_match, used_addresses)
             addr = spawned_match["address"]
             used_addresses.add(addr)
             spawned_ws = spawned_match.get("workspace", {}).get("id")
@@ -378,6 +482,7 @@ async def restore_window(sw, matchable_clients, used_addresses: set):
                 )
             await asyncio.sleep(2.0)
             return addr, sw.get("focus_history_id", 999)
+    trace(f"restore_window no-match class={sw.get('class_name')} ws={ws_id}")
     return None, None
 
 
@@ -405,18 +510,22 @@ async def close_windows_on_workspaces(workspace_ids, timeout=10.0):
 
 
 async def reconcile_late_windows(saved_windows, delay=4.0, timeout=8.0):
-    await asyncio.sleep(delay)
-
     signature_counts = collections.Counter(
         window_signature(sw)
         for sw in saved_windows
         if not is_ambiguous_terminal_window(sw)
+        and sw.get("class_name") != "Docker Desktop"
     )
     pending = [
         sw for sw in saved_windows
         if not is_ambiguous_terminal_window(sw)
+        and sw.get("class_name") != "Docker Desktop"
         and signature_counts[window_signature(sw)] == 1
     ]
+    if not pending:
+        return
+
+    await asyncio.sleep(delay)
 
     attempts = max(1, int(timeout / 0.5))
     for _ in range(attempts):
@@ -439,24 +548,53 @@ async def reconcile_late_windows(saved_windows, delay=4.0, timeout=8.0):
         pending = next_pending
 
 
-async def find_live_matches(sw):
+async def find_live_matches(sw, workspace_id=None):
     clients = await get_clients()
-    return [client for client in clients if client_matches_saved_window(client, sw)]
+    matches = [client for client in clients if client_matches_saved_window(client, sw)]
+    if workspace_id is not None:
+        matches = [
+            client for client in matches
+            if client.get("workspace", {}).get("id") == workspace_id
+        ]
+    return matches
 
 
-async def close_live_matches(sw):
-    matches = await find_live_matches(sw)
+async def close_live_matches(sw, workspace_id=None):
+    matches = await find_live_matches(sw, workspace_id=workspace_id)
+    closed_addresses = set()
     for match in matches:
         addr = match.get("address")
         if addr:
+            closed_addresses.add(addr)
             await dispatch(["closewindow", f"address:{addr}"])
             await asyncio.sleep(0.05)
     if matches:
         await asyncio.sleep(0.5)
+    return closed_addresses
 
 
-async def restore_deferred_window(sw, used_addresses, focus_addr=None, preselect=None, adopt_existing=False):
+async def stabilize_spawned_window(sw, current_client, used_addresses: set):
+    observe_window = stabilization_observe_window(sw)
+    if observe_window <= 0:
+        return current_client
+
+    deadline = asyncio.get_event_loop().time() + observe_window
+    latest = current_client
+    while asyncio.get_event_loop().time() < deadline:
+        matches = await find_live_matches(sw)
+        if len(matches) == 1:
+            latest = matches[0]
+            addr = latest.get("address")
+            if addr:
+                used_addresses.add(addr)
+        await asyncio.sleep(0.1)
+
+    return latest
+
+
+async def restore_deferred_window(sw, used_addresses, focus_addr=None, preselect=None, adopt_existing=False, force_spawn=False):
     ws_id = sw["workspace_id"]
+    trace(f"restore_deferred_window class={sw.get('class_name')} ws={ws_id} focus_addr={focus_addr} preselect={preselect} adopt_existing={adopt_existing} force_spawn={force_spawn}")
     await dispatch(["workspace", str(ws_id)])
     await asyncio.sleep(1.0)
 
@@ -467,8 +605,8 @@ async def restore_deferred_window(sw, used_addresses, focus_addr=None, preselect
         await dispatch(["layoutmsg", "preselect", preselect])
         await asyncio.sleep(0.2)
 
-    matches = await find_live_matches(sw)
-    if adopt_existing and len(matches) == 1:
+    matches = await find_live_matches(sw, workspace_id=ws_id)
+    if adopt_existing and not force_spawn and len(matches) == 1:
         match = matches[0]
         addr = match.get("address")
         if addr:
@@ -478,9 +616,9 @@ async def restore_deferred_window(sw, used_addresses, focus_addr=None, preselect
             return addr, sw.get("focus_history_id", 999)
 
     if matches:
-        await close_live_matches(sw)
+        await close_live_matches(sw, workspace_id=ws_id)
 
-    return await restore_window(sw, [], used_addresses)
+    return await restore_window(sw, [], used_addresses, force_spawn=force_spawn)
 
 
 async def restore_session(name="last_session", clean=False):
@@ -510,6 +648,10 @@ async def restore_session(name="last_session", clean=False):
     else:
         matchable_clients = await get_clients()
 
+    if TRACE_ENABLED:
+        TRACE_PATH.write_text("", encoding="utf-8")
+    trace(f"restore_session start name={name} clean={clean} workspaces={workspace_order}")
+
     used_addresses: set[str] = set()
     focus_candidates = []
     restored_addresses = {}
@@ -517,6 +659,7 @@ async def restore_session(name="last_session", clean=False):
     deferred_steps = []
 
     for ws_id in workspace_order:
+        trace(f"restore_session enter_workspace ws={ws_id}")
         await dispatch(["workspace", str(ws_id)])
         await asyncio.sleep(1.0)
 
@@ -542,6 +685,7 @@ async def restore_session(name="last_session", clean=False):
                 focus_candidates.append((addr, fid))
 
         for step in steps:
+            trace(f"restore_session step ws={ws_id} spawn={step['spawn'].get('class_name')} focus={step['focus'].get('class_name')} preselect={step['preselect']}")
             focus_addr = restored_addresses.get(id(step["focus"]))
             if focus_addr:
                 await focus_window(focus_addr)
@@ -550,18 +694,45 @@ async def restore_session(name="last_session", clean=False):
                     await dispatch(["layoutmsg", "preselect", step["preselect"]])
                     await asyncio.sleep(0.2)
 
-            addr, fid = await restore_window(step["spawn"], matchable_clients, used_addresses)
+            addr, fid = await restore_window(
+                step["spawn"],
+                matchable_clients,
+                used_addresses,
+                force_spawn=bool(step["preselect"]),
+            )
             if not addr:
-                deferred_steps.append(
-                    {
-                        "workspace_id": ws_id,
-                        "focus": step["focus"],
-                        "preselect": step["preselect"],
-                        "spawn": step["spawn"],
-                    }
-                )
+                if step["spawn"].get("class_name") != "Docker Desktop":
+                    deferred_steps.append(
+                        {
+                            "workspace_id": ws_id,
+                            "focus": step["focus"],
+                            "preselect": step["preselect"],
+                            "spawn": step["spawn"],
+                        }
+                    )
                 continue
             restored_addresses[id(step["spawn"])] = addr
+            if step["preselect"] and needs_tiled_stabilization(step["spawn"]):
+                matches = await find_live_matches(
+                    step["spawn"],
+                    workspace_id=step["spawn"]["workspace_id"],
+                )
+                if len(matches) == 1 and client_matches_saved_placement(matches[0], step["spawn"]):
+                    pass
+                else:
+                    focus_addr = restored_addresses.get(id(step["focus"]))
+                    addr, fid = await restore_deferred_window(
+                        step["spawn"],
+                        used_addresses,
+                        focus_addr=focus_addr,
+                        preselect=step["preselect"],
+                        adopt_existing=False,
+                        force_spawn=True,
+                    )
+                    if addr:
+                        restored_addresses[id(step["spawn"])] = addr
+                    if addr and fid is not None:
+                        focus_candidates.append((addr, fid))
             if fid is not None:
                 focus_candidates.append((addr, fid))
 
@@ -604,6 +775,24 @@ async def restore_session(name="last_session", clean=False):
             )
             if addr:
                 restored_addresses[id(step["spawn"])] = addr
+                if step["preselect"] and needs_tiled_stabilization(step["spawn"]):
+                    matches = await find_live_matches(
+                        step["spawn"],
+                        workspace_id=step["spawn"]["workspace_id"],
+                    )
+                    if not (len(matches) == 1 and client_matches_saved_placement(matches[0], step["spawn"])):
+                        addr, fid = await restore_deferred_window(
+                            step["spawn"],
+                            used_addresses,
+                            focus_addr=focus_addr,
+                            preselect=step["preselect"],
+                            adopt_existing=False,
+                            force_spawn=True,
+                        )
+                        if addr:
+                            restored_addresses[id(step["spawn"])] = addr
+                        if addr and fid is not None:
+                            focus_candidates.append((addr, fid))
             if addr and fid is not None:
                 focus_candidates.append((addr, fid))
 
@@ -635,6 +824,7 @@ async def restore_session(name="last_session", clean=False):
     if focus_candidates:
         target_addr = min(focus_candidates, key=lambda x: x[1])[0]
         if target_addr:
+            trace(f"restore_session final_focus addr={target_addr}")
             await dispatch(["focuswindow", f"address:{target_addr}"])
 
     print(f"{GREEN}[+]{RESET} Session restored from: {session_path}")
