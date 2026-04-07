@@ -1,6 +1,9 @@
 import sys
 import asyncio
 import argparse
+import shutil
+import subprocess
+import time
 from .save import save_session
 from .load import restore_session
 from .utils import GREEN, BLUE, YELLOW, RED, BOLD, RESET, list_sessions, get_config_dir
@@ -38,6 +41,7 @@ def print_help():
     )
     print(f"  {GREEN}list{RESET}    List all saved sessions.")
     print(f"  {GREEN}delete{RESET}  Delete a saved session.")
+    print(f"  {GREEN}gui{RESET}     Choose a session in Walker and restore it.")
     print(f"  {GREEN}help{RESET}    Show this magnificent help message.")
 
     print(f"\n{BOLD}EXAMPLES:{RESET}")
@@ -51,11 +55,46 @@ def print_help():
     print(
         f"  hyprvault {GREEN}delete{RESET} {BLUE}my_workspace{RESET}    -> Deletes 'my_workspace'"
     )
+    print(
+        f"  hyprvault {GREEN}gui{RESET}                -> Opens Walker to choose a session"
+    )
 
     print(f"\n{BOLD}SESSION DIR:{RESET} {get_config_dir()}")
     print(
         f"\n{YELLOW}Note: Ensure Hyprland is running before executing load commands.{RESET}"
     )
+
+
+def choose_session_with_walker():
+    sessions = list_sessions()
+    if not sessions:
+        subprocess.run(
+            ["notify-send", "HyprVault", "No saved sessions"], check=False
+        )
+        return None
+
+    if not shutil.which("walker"):
+        print(f"{RED}Walker is not installed.{RESET}")
+        return None
+
+    time.sleep(0.15)
+    proc = subprocess.run(
+        [
+            "walker",
+            "-d",
+            "-e",
+            "-t",
+            "pi",
+            "-p",
+            "Load HyprVault session",
+        ],
+        input="\n".join(sessions) + "\n",
+        text=True,
+        capture_output=True,
+    )
+
+    choice = proc.stdout.strip()
+    return choice or None
 
 
 async def main():
@@ -68,7 +107,7 @@ async def main():
     parser.add_argument(
         "action",
         nargs="?",
-        choices=["save", "load", "list", "delete", "help"],
+        choices=["save", "load", "list", "delete", "gui", "help"],
         help="Action to be performed",
     )
     parser.add_argument("name", nargs="?", default="last_session", help="Session name")
@@ -92,6 +131,15 @@ async def main():
             await restore_session(args.name)
         except Exception as e:
             print(f"{RED}[-]{RESET} Session load error: {e}")
+
+    elif args.action == "gui":
+        chosen = choose_session_with_walker()
+        if chosen:
+            print(f"{BLUE}[*]{RESET} Loading session: {BOLD}{chosen}{RESET}...")
+            try:
+                await restore_session(chosen)
+            except Exception as e:
+                print(f"{RED}[-]{RESET} Session load error: {e}")
 
     elif args.action == "list":
         sessions = list_sessions()

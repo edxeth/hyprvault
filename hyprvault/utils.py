@@ -1,6 +1,8 @@
 """HyprVault utility functions and constants."""
 
 import os
+import shlex
+import shutil
 from pathlib import Path
 
 # Colors
@@ -27,6 +29,92 @@ def get_session_path(name: str) -> Path:
         name = name[:-5]
 
     return get_config_dir() / f"{name}.json"
+
+
+TERMINAL_EMULATORS = {"ghostty"}
+SHELL_EXECUTABLES = {"bash", "dash", "fish", "nu", "sh", "tcsh", "xonsh", "zsh"}
+
+
+def _is_executable(candidate: str) -> bool:
+    if not candidate:
+        return False
+
+    path = Path(candidate)
+    if path.is_file() and os.access(path, os.X_OK):
+        return True
+
+    return shutil.which(candidate) is not None
+
+
+
+def normalize_argv(argv: list[str]) -> list[str]:
+    argv = [arg for arg in argv if arg]
+    if len(argv) != 1 or " " not in argv[0]:
+        return argv
+
+    tokens = argv[0].split()
+    for i in range(len(tokens), 0, -1):
+        candidate = " ".join(tokens[:i])
+        if _is_executable(candidate):
+            return [candidate, *tokens[i:]]
+
+    return argv
+
+
+
+def read_cmdline(pid: int) -> list[str]:
+    try:
+        with open(f"/proc/{pid}/cmdline", "rb") as f:
+            argv = [part.decode("utf-8") for part in f.read().split(b"\0") if part]
+            return normalize_argv(argv)
+    except Exception:
+        return []
+
+
+
+def format_cmdline(argv: list[str]) -> str:
+    return shlex.join(normalize_argv(argv)) if argv else ""
+
+
+
+def normalize_command_string(command: str) -> str:
+    if not command:
+        return ""
+
+    try:
+        argv = shlex.split(command)
+    except Exception:
+        argv = [command]
+
+    return format_cmdline(argv)
+
+
+def read_children(pid: int) -> list[int]:
+    try:
+        with open(f"/proc/{pid}/task/{pid}/children", "r", encoding="utf-8") as f:
+            return [int(child) for child in f.read().split() if child.isdigit()]
+    except Exception:
+        return []
+
+
+def leaf_cmdline(pid: int) -> list[str]:
+    children = read_children(pid)
+    if not children:
+        return read_cmdline(pid)
+
+    for child in children:
+        child_cmd = leaf_cmdline(child)
+        if child_cmd:
+            exe = Path(child_cmd[0]).name
+            if exe not in SHELL_EXECUTABLES:
+                return child_cmd
+
+    return leaf_cmdline(children[0])
+
+
+def is_terminal_emulator(class_name: str) -> bool:
+    normalized = class_name.lower()
+    return normalized in TERMINAL_EMULATORS or normalized.rsplit(".", 1)[-1] in TERMINAL_EMULATORS
 
 
 def list_sessions() -> list[str]:
