@@ -1,4 +1,5 @@
 import asyncio
+import collections
 import json
 import shlex
 from pathlib import Path
@@ -138,6 +139,15 @@ def is_ambiguous_terminal_window(sw):
     return len(argv) == 1 and Path(argv[0]).name.lower() in TERMINAL_EMULATORS
 
 
+def window_signature(sw):
+    return (
+        (sw.get("class_name") or "").lower(),
+        normalize_command_string(sw.get("match_command") or sw.get("command", "")),
+        normalize_command_string(sw.get("leaf_command", "")),
+    )
+
+
+
 def find_best_match(sw, current_clients, used_addresses: set):
     saved_launcher = normalize_command_string(sw.get("match_command") or sw.get("command", ""))
     saved_leaf = normalize_command_string(sw.get("leaf_command", ""))
@@ -223,6 +233,16 @@ def order_tiled_windows(saved_windows):
     return order_tiled_windows(first) + order_tiled_windows(second)
 
 
+def is_late_prone_window(sw):
+    return sw.get("class_name") == "Docker Desktop"
+
+
+
+def opposite_direction(direction):
+    return {"r": "l", "l": "r", "d": "u", "u": "d"}.get(direction, direction)
+
+
+
 def build_tiled_restore_plan(saved_windows):
     if not saved_windows:
         return None, []
@@ -239,6 +259,17 @@ def build_tiled_restore_plan(saved_windows):
     anchor_first, steps_first = build_tiled_restore_plan(first)
     anchor_second, steps_second = build_tiled_restore_plan(second)
     direction = "r" if orientation == "vertical" else "d"
+
+    if (
+        len(saved_windows) == 2
+        and len(first) == 1
+        and len(second) == 1
+        and is_late_prone_window(anchor_first)
+        and not is_late_prone_window(anchor_second)
+    ):
+        return anchor_second, [
+            {"focus": anchor_second, "spawn": anchor_first, "preselect": opposite_direction(direction)}
+        ]
 
     return anchor_first, [
         {"focus": anchor_first, "spawn": anchor_second, "preselect": direction},
@@ -336,12 +367,14 @@ async def restore_window(sw, matchable_clients, used_addresses: set):
         if spawned_match:
             addr = spawned_match["address"]
             used_addresses.add(addr)
-            if sw["is_floating"] or sw.get("fullscreen", 0) > 0:
+            spawned_ws = spawned_match.get("workspace", {}).get("id")
+            needs_workspace_fix = spawned_ws != ws_id
+            if sw["is_floating"] or sw.get("fullscreen", 0) > 0 or needs_workspace_fix:
                 await apply_window_state(
                     sw,
                     addr,
                     spawned_match.get("fullscreen", 0),
-                    move_workspace=sw["is_floating"],
+                    move_workspace=sw["is_floating"] or needs_workspace_fix,
                 )
             await asyncio.sleep(2.0)
             return addr, sw.get("focus_history_id", 999)
@@ -369,6 +402,85 @@ async def close_windows_on_workspaces(workspace_ids, timeout=10.0):
                 await asyncio.sleep(0.05)
 
         await asyncio.sleep(0.2)
+
+
+async def reconcile_late_windows(saved_windows, delay=4.0, timeout=8.0):
+    await asyncio.sleep(delay)
+
+    signature_counts = collections.Counter(
+        window_signature(sw)
+        for sw in saved_windows
+        if not is_ambiguous_terminal_window(sw)
+    )
+    pending = [
+        sw for sw in saved_windows
+        if not is_ambiguous_terminal_window(sw)
+        and signature_counts[window_signature(sw)] == 1
+    ]
+
+    attempts = max(1, int(timeout / 0.5))
+    for _ in range(attempts):
+        if not pending:
+            return
+
+        clients = await get_clients()
+        next_pending = []
+        for sw in pending:
+            matches = [client for client in clients if client_matches_saved_window(client, sw)]
+            if len(matches) != 1:
+                next_pending.append(sw)
+                continue
+
+            match = matches[0]
+            if match.get("workspace", {}).get("id") != sw["workspace_id"]:
+                await apply_window_state(sw, match["address"], match.get("fullscreen", 0), move_workspace=True)
+
+        await asyncio.sleep(0.5)
+        pending = next_pending
+
+
+async def find_live_matches(sw):
+    clients = await get_clients()
+    return [client for client in clients if client_matches_saved_window(client, sw)]
+
+
+async def close_live_matches(sw):
+    matches = await find_live_matches(sw)
+    for match in matches:
+        addr = match.get("address")
+        if addr:
+            await dispatch(["closewindow", f"address:{addr}"])
+            await asyncio.sleep(0.05)
+    if matches:
+        await asyncio.sleep(0.5)
+
+
+async def restore_deferred_window(sw, used_addresses, focus_addr=None, preselect=None, adopt_existing=False):
+    ws_id = sw["workspace_id"]
+    await dispatch(["workspace", str(ws_id)])
+    await asyncio.sleep(1.0)
+
+    if focus_addr:
+        await focus_window(focus_addr)
+        await asyncio.sleep(0.2)
+    if preselect:
+        await dispatch(["layoutmsg", "preselect", preselect])
+        await asyncio.sleep(0.2)
+
+    matches = await find_live_matches(sw)
+    if adopt_existing and len(matches) == 1:
+        match = matches[0]
+        addr = match.get("address")
+        if addr:
+            used_addresses.add(addr)
+            if match.get("workspace", {}).get("id") != ws_id:
+                await apply_window_state(sw, addr, match.get("fullscreen", 0), move_workspace=True)
+            return addr, sw.get("focus_history_id", 999)
+
+    if matches:
+        await close_live_matches(sw)
+
+    return await restore_window(sw, [], used_addresses)
 
 
 async def restore_session(name="last_session", clean=False):
@@ -401,6 +513,8 @@ async def restore_session(name="last_session", clean=False):
     used_addresses: set[str] = set()
     focus_candidates = []
     restored_addresses = {}
+    deferred_workspace_plans = []
+    deferred_steps = []
 
     for ws_id in workspace_order:
         await dispatch(["workspace", str(ws_id)])
@@ -413,9 +527,18 @@ async def restore_session(name="last_session", clean=False):
         anchor, steps = build_tiled_restore_plan(tiled)
         if anchor:
             addr, fid = await restore_window(anchor, matchable_clients, used_addresses)
-            if addr:
-                restored_addresses[id(anchor)] = addr
-            if addr and fid is not None:
+            if not addr:
+                deferred_workspace_plans.append(
+                    {
+                        "workspace_id": ws_id,
+                        "anchor": anchor,
+                        "steps": steps,
+                        "floating": floating,
+                    }
+                )
+                continue
+            restored_addresses[id(anchor)] = addr
+            if fid is not None:
                 focus_candidates.append((addr, fid))
 
         for step in steps:
@@ -428,17 +551,86 @@ async def restore_session(name="last_session", clean=False):
                     await asyncio.sleep(0.2)
 
             addr, fid = await restore_window(step["spawn"], matchable_clients, used_addresses)
+            if not addr:
+                deferred_steps.append(
+                    {
+                        "workspace_id": ws_id,
+                        "focus": step["focus"],
+                        "preselect": step["preselect"],
+                        "spawn": step["spawn"],
+                    }
+                )
+                continue
+            restored_addresses[id(step["spawn"])] = addr
+            if fid is not None:
+                focus_candidates.append((addr, fid))
+
+        for sw in floating:
+            addr, fid = await restore_window(sw, matchable_clients, used_addresses)
+            if not addr:
+                deferred_steps.append(
+                    {
+                        "workspace_id": ws_id,
+                        "focus": None,
+                        "preselect": None,
+                        "spawn": sw,
+                    }
+                )
+                continue
+            restored_addresses[id(sw)] = addr
+            if fid is not None:
+                focus_candidates.append((addr, fid))
+
+    if deferred_workspace_plans or deferred_steps:
+        await asyncio.sleep(3.0)
+
+    for plan in deferred_workspace_plans:
+        anchor = plan["anchor"]
+        addr, fid = await restore_deferred_window(anchor, used_addresses, adopt_existing=True)
+        if not addr:
+            continue
+        restored_addresses[id(anchor)] = addr
+        if fid is not None:
+            focus_candidates.append((addr, fid))
+
+        for step in plan["steps"]:
+            focus_addr = restored_addresses.get(id(step["focus"]))
+            addr, fid = await restore_deferred_window(
+                step["spawn"],
+                used_addresses,
+                focus_addr=focus_addr,
+                preselect=step["preselect"],
+                adopt_existing=False,
+            )
             if addr:
                 restored_addresses[id(step["spawn"])] = addr
             if addr and fid is not None:
                 focus_candidates.append((addr, fid))
 
-        for sw in floating:
-            addr, fid = await restore_window(sw, matchable_clients, used_addresses)
+        for sw in plan["floating"]:
+            addr, fid = await restore_deferred_window(sw, used_addresses, adopt_existing=True)
             if addr:
                 restored_addresses[id(sw)] = addr
             if addr and fid is not None:
                 focus_candidates.append((addr, fid))
+
+    for step in deferred_steps:
+        focus_addr = None
+        if step["focus"] is not None:
+            focus_addr = restored_addresses.get(id(step["focus"]))
+        addr, fid = await restore_deferred_window(
+            step["spawn"],
+            used_addresses,
+            focus_addr=focus_addr,
+            preselect=step["preselect"],
+            adopt_existing=focus_addr is None,
+        )
+        if addr:
+            restored_addresses[id(step["spawn"])] = addr
+        if addr and fid is not None:
+            focus_candidates.append((addr, fid))
+
+    await reconcile_late_windows(saved_windows)
 
     if focus_candidates:
         target_addr = min(focus_candidates, key=lambda x: x[1])[0]
