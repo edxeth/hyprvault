@@ -35,7 +35,15 @@ TERMINAL_EMULATORS = {"ghostty"}
 SHELL_EXECUTABLES = {"bash", "dash", "fish", "nu", "sh", "tcsh", "xonsh", "zsh"}
 
 
+def _strip_outer_quotes(value: str) -> str:
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in {'"', "'"}:
+        return value[1:-1]
+    return value
+
+
+
 def _is_executable(candidate: str) -> bool:
+    candidate = _strip_outer_quotes(candidate)
     if not candidate:
         return False
 
@@ -48,15 +56,16 @@ def _is_executable(candidate: str) -> bool:
 
 
 def normalize_argv(argv: list[str]) -> list[str]:
-    argv = [arg for arg in argv if arg]
+    argv = [_strip_outer_quotes(arg) for arg in argv if arg]
     if len(argv) != 1 or " " not in argv[0]:
         return argv
 
-    tokens = argv[0].split()
+    blob = _strip_outer_quotes(argv[0])
+    tokens = blob.split()
     for i in range(len(tokens), 0, -1):
         candidate = " ".join(tokens[:i])
         if _is_executable(candidate):
-            return [candidate, *tokens[i:]]
+            return [_strip_outer_quotes(candidate), *[_strip_outer_quotes(token) for token in tokens[i:]]]
 
     return argv
 
