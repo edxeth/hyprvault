@@ -641,6 +641,7 @@ async def restore_session(name="last_session", clean=False):
             grouped_windows[ws_id] = []
             workspace_order.append(ws_id)
         grouped_windows[ws_id].append(sw)
+    workspace_order.sort()
 
     if clean:
         await close_windows_on_workspaces(workspace_order)
