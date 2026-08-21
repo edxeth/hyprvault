@@ -110,9 +110,24 @@ def normalize_command_string(command: str) -> str:
 
 
 def read_children(pid: int) -> list[int]:
+    children: list[int] = []
+    seen: set[int] = set()
     try:
-        with open(f"/proc/{pid}/task/{pid}/children", "r", encoding="utf-8") as f:
-            return [int(child) for child in f.read().split() if child.isdigit()]
+        # Children may be forked by any thread of the process (e.g. a
+        # single-instance terminal's worker thread), so read the children
+        # file of every thread, not just the main one.
+        task_dir = Path(f"/proc/{pid}/task")
+        tasks = sorted(task_dir.iterdir()) if task_dir.is_dir() else []
+        for task in tasks:
+            try:
+                with open(task / "children", "r", encoding="utf-8") as f:
+                    for child in f.read().split():
+                        if child.isdigit() and int(child) not in seen:
+                            seen.add(int(child))
+                            children.append(int(child))
+            except (FileNotFoundError, NotADirectoryError, PermissionError):
+                continue
+        return children
     except Exception:
         return []
 
@@ -122,14 +137,25 @@ def leaf_cmdline(pid: int) -> list[str]:
     if not children:
         return read_cmdline(pid)
 
+    first_shell = None
     for child in children:
-        child_cmd = leaf_cmdline(child)
+        child_cmd = read_cmdline(child)
         if child_cmd:
             exe = Path(child_cmd[0]).name
             if exe not in SHELL_EXECUTABLES:
+                # The first non-shell child is the terminal's session program.
+                # A non-shell program that manages sub-processes (a
+                # multiplexer with panes) is the leaf itself: its panes are
+                # the window's contents, not the window's identity.
                 return child_cmd
+            if first_shell is None:
+                first_shell = child
 
-    return leaf_cmdline(children[0])
+    if first_shell is not None:
+        return leaf_cmdline(first_shell)
+    if children:
+        return leaf_cmdline(children[0])
+    return read_cmdline(pid)
 
 
 def is_terminal_emulator(class_name: str) -> bool:
