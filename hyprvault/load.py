@@ -11,6 +11,7 @@ from .utils import (
     GREEN,
     RED,
     RESET,
+    SHELL_EXECUTABLES,
     TERMINAL_EMULATORS,
     YELLOW,
     format_cmdline,
@@ -101,9 +102,50 @@ async def focus_window(addr, timeout=1.0):
 
 def client_commands(client):
     pid = client.get("pid", 0)
-    launcher = format_cmdline(read_cmdline(pid))
-    leaf = format_cmdline(leaf_cmdline(pid))
-    return launcher, leaf
+    launcher_argv = read_cmdline(pid)
+    core, payload_leaf = launcher_match_keys(launcher_argv)
+    proc_leaf = format_cmdline(leaf_cmdline(pid))
+
+    # A spawned `-e` terminal runs its command outside the window pid's /proc
+    # children (leaf_cmdline then falls back to the whole launcher argv), so
+    # trust the /proc leaf only when a real child command was found.
+    if not proc_leaf or proc_leaf == format_cmdline(launcher_argv):
+        proc_leaf = payload_leaf
+    return core, proc_leaf
+
+
+def launcher_match_keys(argv):
+    """Split a launcher argv into (core, leaf): the part before `-e`, and the
+    command the window runs, unwrapping the `sh -lc` wrapper the save side
+    builds for terminals launched as `term -e sh -lc <leaf>`."""
+    if not argv:
+        return "", ""
+
+    core_argv = argv
+    leaf_argv = []
+    if "-e" in argv:
+        e_index = argv.index("-e")
+        core_argv = argv[:e_index]
+        rest = argv[e_index + 1:]
+        if (
+            len(rest) >= 3
+            and Path(rest[0]).name in SHELL_EXECUTABLES
+            and rest[1] in {"-lc", "-c"}
+        ):
+            rest = rest[2:]
+        leaf_argv = rest
+    return format_cmdline(core_argv), format_cmdline(leaf_argv)
+
+
+def saved_match_keys(sw):
+    saved_launcher = normalize_command_string(sw.get("match_command") or sw.get("command", ""))
+    try:
+        argv = shlex.split(saved_launcher)
+    except Exception:
+        argv = [saved_launcher] if saved_launcher else []
+    core, payload_leaf = launcher_match_keys(argv)
+    leaf = normalize_command_string(sw.get("leaf_command", "")) or payload_leaf
+    return core, leaf
 
 
 def class_matches_saved_window(client_class, saved_class):
@@ -126,11 +168,10 @@ def client_matches_saved_window(client, sw):
     if not class_matches_saved_window(client.get("class"), sw["class_name"]):
         return False
 
-    saved_launcher = normalize_command_string(sw.get("match_command") or sw.get("command", ""))
-    saved_leaf = normalize_command_string(sw.get("leaf_command", ""))
+    saved_core, saved_leaf = saved_match_keys(sw)
     launcher, leaf = client_commands(client)
 
-    if saved_launcher and launcher != saved_launcher:
+    if saved_core and launcher != saved_core:
         return False
     if saved_leaf and leaf != saved_leaf:
         return False
@@ -413,10 +454,9 @@ async def restore_window(sw, matchable_clients, used_addresses: set, force_spawn
         if refreshed_match is None:
             match = None
         else:
-            saved_launcher = normalize_command_string(sw.get("match_command") or sw.get("command", ""))
-            saved_leaf = normalize_command_string(sw.get("leaf_command", ""))
+            saved_core, saved_leaf = saved_match_keys(sw)
             launcher, leaf = client_commands(refreshed_match)
-            if saved_launcher and launcher != saved_launcher:
+            if saved_core and launcher != saved_core:
                 match = None
             elif saved_leaf and leaf != saved_leaf:
                 match = None

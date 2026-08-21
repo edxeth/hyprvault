@@ -200,5 +200,51 @@ class ForceSpawnAdoptionTest(unittest.TestCase):
         self.assertEqual(1, len(spawned))
 
 
+class SpawnedTerminalLeafMatchTest(unittest.TestCase):
+    """A terminal spawned via `term -e sh -lc '<cmd>'` has no /proc children
+    for its leaf process, so the leaf must be recovered from the launcher argv
+    itself — otherwise hyprvault can never match the window it spawned."""
+
+    def run_match(self, saved_leaf, live_argv, live_leaf_argv):
+        saved = {
+            "command": "ghostty -e sh -lc 'nvim /tmp/release-notes.md'",
+            "class_name": "com.mitchellh.ghostty",
+            "match_command": "ghostty",
+            "leaf_command": saved_leaf,
+        }
+        client = {
+            "class": "com.mitchellh.ghostty",
+            "pid": 123,
+        }
+
+        with (
+            patch.object(load, "read_cmdline", lambda pid: live_argv),
+            patch.object(load, "leaf_cmdline", lambda pid: live_leaf_argv),
+        ):
+            return load.client_matches_saved_window(client, saved)
+
+    def test_spawned_e_terminal_matches_its_saved_leaf(self):
+        live_argv = ["ghostty", "-e", "sh", "-lc", "nvim /tmp/release-notes.md"]
+        # /proc children empty: leaf_cmdline falls back to the launcher argv
+        self.assertTrue(
+            self.run_match("nvim /tmp/release-notes.md", live_argv, live_argv)
+        )
+
+    def test_spawned_e_terminal_with_other_leaf_still_fails(self):
+        live_argv = ["ghostty", "-e", "sh", "-lc", "nvim /tmp/other.md"]
+        self.assertFalse(
+            self.run_match("nvim /tmp/release-notes.md", live_argv, live_argv)
+        )
+
+    def test_interactive_terminal_with_proc_leaf_still_matches(self):
+        self.assertTrue(
+            self.run_match(
+                "nvim /tmp/release-notes.md",
+                ["ghostty"],
+                ["nvim", "/tmp/release-notes.md"],
+            )
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
