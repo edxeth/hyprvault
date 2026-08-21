@@ -1,7 +1,7 @@
 import json
 import shlex
 import subprocess
-from dataclasses import dataclass, asdict
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import List
 
@@ -31,10 +31,13 @@ class WindowState:
     size: List[int]
     match_command: str = ""
     leaf_command: str = ""
+    address: str = ""
+    grouped: List[str] = field(default_factory=list)
 
     @classmethod
     def from_dict(cls, data: dict):
         return cls(
+            address=data.get("address", ""),
             command=data.get("command", ""),
             class_name=data.get("class", ""),
             workspace_id=data["workspace"]["id"],
@@ -45,6 +48,7 @@ class WindowState:
             size=data.get("size", [0, 0]),
             match_command=data.get("match_command", ""),
             leaf_command=data.get("leaf_command", ""),
+            grouped=data.get("grouped", []) or [],
         )
 
 

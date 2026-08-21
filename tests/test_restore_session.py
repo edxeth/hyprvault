@@ -79,7 +79,7 @@ class RestoreSessionOrderTest(unittest.TestCase):
 
             return workspace_dispatches, restored_commands
 
-    def test_restores_workspaces_in_numeric_order_not_json_first_seen_order(self):
+    def test_restores_workspaces_in_numeric_order_then_returns_to_workspace_one(self):
         workspace_dispatches, restored_commands = self.run_restore_with_session(
             [
                 saved_window("workspace-four", 4),
@@ -88,7 +88,7 @@ class RestoreSessionOrderTest(unittest.TestCase):
             ]
         )
 
-        self.assertEqual([1, 2, 4], workspace_dispatches)
+        self.assertEqual([1, 2, 4, 1], workspace_dispatches)
         self.assertEqual(["workspace-one", "workspace-two", "workspace-four"], restored_commands)
 
     def test_uses_saved_geometry_plan_within_each_workspace(self):
@@ -99,7 +99,7 @@ class RestoreSessionOrderTest(unittest.TestCase):
             ]
         )
 
-        self.assertEqual([1], workspace_dispatches)
+        self.assertEqual([1, 1], workspace_dispatches)
         self.assertEqual(["left-window", "right-window"], restored_commands)
 
 

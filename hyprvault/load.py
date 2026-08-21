@@ -48,7 +48,8 @@ async def dispatch(cmd_args, wait=True):
         stderr=asyncio.subprocess.DEVNULL,
     )
     if wait:
-        await proc.wait()
+        return await proc.wait() == 0
+    return None
 
 
 async def init_hypr_config():
@@ -510,6 +511,7 @@ async def close_windows_on_workspaces(workspace_ids, timeout=10.0):
 
 
 async def reconcile_late_windows(saved_windows, delay=4.0, timeout=8.0):
+    restored_addresses = {}
     signature_counts = collections.Counter(
         window_signature(sw)
         for sw in saved_windows
@@ -523,14 +525,14 @@ async def reconcile_late_windows(saved_windows, delay=4.0, timeout=8.0):
         and signature_counts[window_signature(sw)] == 1
     ]
     if not pending:
-        return
+        return restored_addresses
 
     await asyncio.sleep(delay)
 
     attempts = max(1, int(timeout / 0.5))
     for _ in range(attempts):
         if not pending:
-            return
+            return restored_addresses
 
         clients = await get_clients()
         next_pending = []
@@ -541,11 +543,16 @@ async def reconcile_late_windows(saved_windows, delay=4.0, timeout=8.0):
                 continue
 
             match = matches[0]
+            address = match.get("address")
+            if address:
+                restored_addresses[id(sw)] = address
             if match.get("workspace", {}).get("id") != sw["workspace_id"]:
                 await apply_window_state(sw, match["address"], match.get("fullscreen", 0), move_workspace=True)
 
         await asyncio.sleep(0.5)
         pending = next_pending
+
+    return restored_addresses
 
 
 async def find_live_matches(sw, workspace_id=None):
@@ -619,6 +626,309 @@ async def restore_deferred_window(sw, used_addresses, focus_addr=None, preselect
         await close_live_matches(sw, workspace_id=ws_id)
 
     return await restore_window(sw, [], used_addresses, force_spawn=force_spawn)
+
+
+def restored_window_groups(saved_windows):
+    """Return disjoint ordered groups using snapshot-local window addresses."""
+    saved_by_address = {
+        sw.get("address"): sw
+        for sw in saved_windows
+        if sw.get("address")
+    }
+
+    candidates = []
+    seen = set()
+    for sw in saved_windows:
+        grouped_addresses = list(dict.fromkeys(sw.get("grouped", [])))
+        if not grouped_addresses:
+            continue
+
+        # Hyprland currently includes the window itself. Union it defensively
+        # so a schema drift or inconsistent snapshot cannot create singletons.
+        saved_address = sw.get("address")
+        if saved_address and saved_address not in grouped_addresses:
+            grouped_addresses.insert(0, saved_address)
+
+        members = []
+        for address in grouped_addresses:
+            member = saved_by_address.get(address)
+            if member is None:
+                members = []
+                break
+            if member not in members:
+                members.append(member)
+
+        if not members:
+            continue
+        if len({member.get("workspace_id") for member in members}) != 1:
+            continue
+
+        key = tuple(sorted(member["address"] for member in members))
+        if key in seen:
+            continue
+        seen.add(key)
+        candidates.append(members)
+
+    groups = []
+    claimed_addresses = set()
+    for members in sorted(candidates, key=len, reverse=True):
+        addresses = {member["address"] for member in members}
+        if claimed_addresses.intersection(addresses):
+            continue
+        claimed_addresses.update(addresses)
+        groups.append(members)
+
+    return groups
+
+
+def direction_to_window(source, target):
+    """Return the Hyprland direction from source toward target."""
+    source_at = source.get("at")
+    source_size = source.get("size")
+    target_at = target.get("at")
+    target_size = target.get("size")
+    if not source_at or not source_size or not target_at or not target_size:
+        return None
+
+    source_center = (
+        source_at[0] + source_size[0] / 2,
+        source_at[1] + source_size[1] / 2,
+    )
+    target_center = (
+        target_at[0] + target_size[0] / 2,
+        target_at[1] + target_size[1] / 2,
+    )
+    dx = target_center[0] - source_center[0]
+    dy = target_center[1] - source_center[1]
+
+    if dx == 0 and dy == 0:
+        return None
+    if abs(dx) >= abs(dy):
+        return "r" if dx > 0 else "l"
+    return "d" if dy > 0 else "u"
+
+
+def warn_group_restore(members, reason):
+    labels = [
+        member.get("class_name") or member.get("command") or member.get("address", "?")
+        for member in members
+    ]
+    print(
+        f"{YELLOW}[!]{RESET} Window group not restored ({reason}): "
+        + ", ".join(labels)
+    )
+
+
+async def wait_for_group(addresses, timeout=1.0):
+    attempts = max(1, int(timeout / 0.05))
+    for _ in range(attempts):
+        clients = {client.get("address"): client for client in await get_clients()}
+        if all(
+            set(clients.get(address, {}).get("grouped", [])) == set(addresses)
+            for address in addresses
+        ):
+            return True
+        await asyncio.sleep(0.05)
+    return False
+
+
+async def wait_for_ungrouped(addresses, timeout=1.0):
+    attempts = max(1, int(timeout / 0.05))
+    for _ in range(attempts):
+        clients = {client.get("address"): client for client in await get_clients()}
+        if all(not clients.get(address, {}).get("grouped") for address in addresses):
+            return True
+        await asyncio.sleep(0.05)
+    return False
+
+
+async def rollback_group_attempt(attempted_addresses, original_groups):
+    affected_addresses = set(attempted_addresses)
+    clients = {client.get("address"): client for client in await get_clients()}
+
+    for address in reversed(attempted_addresses[1:]):
+        grouped = clients.get(address, {}).get("grouped", [])
+        affected_addresses.update(grouped)
+        if not grouped:
+            continue
+        trace(f"restore_groups rollback-member address={address}")
+        await dispatch(["moveoutofgroup", f"address:{address}"])
+        await asyncio.sleep(0.05)
+        clients = {client.get("address"): client for client in await get_clients()}
+
+    clients = {client.get("address"): client for client in await get_clients()}
+    for address in affected_addresses:
+        if original_groups.get(address):
+            continue
+        if clients.get(address, {}).get("grouped") != [address]:
+            continue
+        if not await focus_window(address):
+            continue
+        trace(f"restore_groups rollback-singleton address={address}")
+        await dispatch(["togglegroup"])
+        await wait_for_ungrouped([address])
+
+    clients = {client.get("address"): client for client in await get_clients()}
+    return [
+        address
+        for address in affected_addresses
+        if set(clients.get(address, {}).get("grouped", []))
+        != set(original_groups.get(address, []))
+    ]
+
+
+async def restore_groups(saved_windows, restored_addresses):
+    """Recreate saved window groups after all window placement is complete."""
+    for members in restored_window_groups(saved_windows):
+        missing_members = [
+            member for member in members if not restored_addresses.get(id(member))
+        ]
+        if missing_members:
+            trace(
+                "restore_groups incomplete members="
+                + ",".join(member.get("address", "") for member in missing_members)
+            )
+            warn_group_restore(members, "incomplete members")
+            continue
+
+        live_addresses = [restored_addresses[id(member)] for member in members]
+        clients = {client.get("address"): client for client in await get_clients()}
+
+        already_restored = all(
+            set(clients.get(address, {}).get("grouped", [])) == set(live_addresses)
+            for address in live_addresses
+        )
+        active_member = min(
+            members,
+            key=lambda member: member.get("focus_history_id", 999),
+        )
+        active_address = restored_addresses[id(active_member)]
+        if already_restored:
+            await focus_window(active_address)
+            continue
+
+        conflicting_addresses = [
+            address
+            for address in live_addresses
+            if clients.get(address, {}).get("grouped")
+        ]
+        if conflicting_addresses:
+            trace(
+                "restore_groups conflicting-existing members="
+                + ",".join(conflicting_addresses)
+            )
+            warn_group_restore(members, "members already grouped differently")
+            continue
+
+        fullscreen_addresses = [
+            address
+            for address in live_addresses
+            if clients.get(address, {}).get("fullscreen", 0) > 0
+        ]
+        if fullscreen_addresses:
+            trace(
+                "restore_groups fullscreen members="
+                + ",".join(fullscreen_addresses)
+            )
+            warn_group_restore(members, "fullscreen members")
+            continue
+
+        if len(live_addresses) == 1:
+            address = live_addresses[0]
+            if await focus_window(address):
+                trace(f"restore_groups single address={address}")
+                success = await dispatch(["togglegroup"])
+                if success is False or not await wait_for_group([address]):
+                    warn_group_restore(members, "single-member verification failed")
+            continue
+
+        anchor_address = live_addresses[0]
+        original_groups = {
+            address: list(client.get("grouped", []))
+            for address, client in clients.items()
+        }
+        join_plan = []
+        plan_failure = None
+        for member_address in live_addresses[1:]:
+            source = clients.get(member_address)
+            target = clients.get(anchor_address)
+            if source is None or target is None:
+                trace(
+                    f"restore_groups missing-client anchor={anchor_address} "
+                    f"member={member_address}"
+                )
+                join_plan = []
+                plan_failure = "missing live client"
+                break
+
+            direction = direction_to_window(source, target)
+            if direction is None:
+                trace(
+                    f"restore_groups no-direction anchor={anchor_address} "
+                    f"member={member_address}"
+                )
+                join_plan = []
+                plan_failure = "ambiguous window direction"
+                break
+            join_plan.append((member_address, direction))
+
+        if len(join_plan) != len(live_addresses) - 1:
+            warn_group_restore(members, plan_failure or "incomplete join plan")
+            continue
+
+        grouped_addresses = [anchor_address]
+        for member_address, direction in join_plan:
+            if not await focus_window(member_address):
+                rollback_failures = await rollback_group_attempt(
+                    grouped_addresses,
+                    original_groups,
+                )
+                warn_group_restore(members, "member focus failed")
+                if rollback_failures:
+                    warn_group_restore(members, "rollback incomplete")
+                break
+
+            dispatcher = (
+                "moveintogroup"
+                if len(grouped_addresses) > 1
+                else "moveintoorcreategroup"
+            )
+            trace(
+                f"restore_groups join dispatcher={dispatcher} direction={direction} "
+                f"anchor={anchor_address} member={member_address}"
+            )
+            success = await dispatch([dispatcher, direction])
+            if success is False:
+                trace(
+                    f"restore_groups dispatch-failed dispatcher={dispatcher} "
+                    f"member={member_address}"
+                )
+                rollback_failures = await rollback_group_attempt(
+                    [*grouped_addresses, member_address],
+                    original_groups,
+                )
+                warn_group_restore(members, "group dispatcher failed")
+                if rollback_failures:
+                    warn_group_restore(members, "rollback incomplete")
+                break
+            await asyncio.sleep(0.05)
+            grouped_addresses.append(member_address)
+            if not await wait_for_group(grouped_addresses):
+                trace(
+                    "restore_groups verification-failed members="
+                    + ",".join(grouped_addresses)
+                )
+                rollback_failures = await rollback_group_attempt(
+                    grouped_addresses,
+                    original_groups,
+                )
+                warn_group_restore(members, "group verification failed")
+                if rollback_failures:
+                    warn_group_restore(members, "rollback incomplete")
+                break
+
+        if grouped_addresses == live_addresses:
+            await focus_window(active_address)
 
 
 async def restore_session(name="last_session", clean=False):
@@ -820,13 +1130,19 @@ async def restore_session(name="last_session", clean=False):
         if addr and fid is not None:
             focus_candidates.append((addr, fid))
 
-    await reconcile_late_windows(saved_windows)
+    late_addresses = await reconcile_late_windows(saved_windows)
+    if late_addresses:
+        restored_addresses.update(late_addresses)
+    await restore_groups(saved_windows, restored_addresses)
 
     if focus_candidates:
         target_addr = min(focus_candidates, key=lambda x: x[1])[0]
         if target_addr:
             trace(f"restore_session final_focus addr={target_addr}")
             await dispatch(["focuswindow", f"address:{target_addr}"])
+
+    trace("restore_session return_workspace ws=1")
+    await dispatch(["workspace", "1"])
 
     print(f"{GREEN}[+]{RESET} Session restored from: {session_path}")
 

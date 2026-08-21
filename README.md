@@ -10,6 +10,7 @@
 
 - 💾 **Save Sessions** — Capture window positions, workspaces, floating/tiled state, and fullscreen mode
 - 🔄 **Restore Sessions** — Reopen windows in their exact positions with proper workspace assignment
+- 🗂️ **Restore Window Groups** — Preserve grouped tabs and the active tab
 - 📋 **List Sessions** — View all saved sessions
 - 🗑️ **Delete Sessions** — Remove unwanted session files
 - 🏠 **XDG Compliant** — Sessions stored in `~/.config/hyprvault/sessions/`
@@ -78,11 +79,20 @@ Each session captures:
 - Window position and size
 - Fullscreen state
 - Focus history
+- Window-group membership
 
 ## ⚙️ How It Works
 
-1. **Save**: Uses `hyprctl clients -j` to get window info, reads `/proc/{pid}/cmdline` for commands
-2. **Load**: Matches existing windows by class name, moves them to saved workspaces, or spawns new ones
+1. **Save**: Uses `hyprctl clients -j` to get window info, including group membership, and reads `/proc/{pid}/cmdline` for commands
+2. **Load**: Matches existing windows by class name, moves them to saved workspaces or spawns new ones, rebuilds grouped tabs after window placement is complete, then returns to workspace 1
+
+Older session files without group data remain supported and restore without group operations.
+Existing live groups with the correct members are left intact instead of being destructively reordered.
+New group reconstruction is all-or-nothing: if any member cannot be joined and verified, HyprVault rolls back the group attempt.
+If HyprVault cannot determine a safe group join—for example because members are
+fullscreen, already grouped differently, incomplete, or geometrically
+indistinguishable—it leaves those windows untouched and records the reason in
+the optional restore trace.
 
 ## 🧪 Restore Tracing
 
@@ -98,7 +108,8 @@ Optional custom trace path:
 HYPRVAULT_TRACE_ACTIONS=1 HYPRVAULT_TRACE_PATH=/tmp/hyprvault-trace.log hyprvault load my_workspace
 ```
 
-The trace records workspace switches, focus attempts, spawn attempts, deferred restores, and final focus decisions.
+The trace records workspace switches, focus attempts, spawn attempts, deferred restores,
+group joins and rollbacks, and final focus decisions.
 Default trace path:
 
 ```bash
