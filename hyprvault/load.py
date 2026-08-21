@@ -442,6 +442,20 @@ async def restore_window(sw, matchable_clients, used_addresses: set, force_spawn
     if cmd:
         closed_addresses = set()
         if force_spawn:
+            # A preselect step replays to get deterministic tile placement, but
+            # a live window already at the exact saved placement needs no replay:
+            # closing it would only churn a correctly-placed application.
+            exact_matches = [
+                client
+                for client in await find_live_matches(sw, workspace_id=ws_id)
+                if client.get("address") not in used_addresses
+                and client_matches_saved_placement(client, sw)
+            ]
+            if len(exact_matches) == 1:
+                addr = exact_matches[0]["address"]
+                trace(f"restore_window force-adopt class={sw.get('class_name')} ws={ws_id} addr={addr}")
+                used_addresses.add(addr)
+                return addr, sw.get("focus_history_id", 999)
             closed_addresses = await close_live_matches(sw, workspace_id=ws_id)
         live_clients = await get_clients()
         existing_addresses = {

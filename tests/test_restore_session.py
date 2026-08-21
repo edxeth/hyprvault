@@ -103,5 +103,102 @@ class RestoreSessionOrderTest(unittest.TestCase):
         self.assertEqual(["left-window", "right-window"], restored_commands)
 
 
+class ForceSpawnAdoptionTest(unittest.TestCase):
+    """Preselect steps force-spawn, but a live window already at the exact
+    saved placement must be adopted instead of closed and respawned."""
+
+    def run_force_restore(self, saved, live_clients, launcher_map):
+        events = []
+        spawned = []
+
+        async def fake_get_clients():
+            return [dict(client) for client in live_clients.values()]
+
+        async def fake_dispatch(cmd_args, wait=True):
+            events.append(tuple(cmd_args))
+            return True
+
+        async def fake_sleep(delay):
+            return None
+
+        def fake_client_commands(client):
+            return launcher_map.get(client["address"], ("", ""))
+
+        class FakeProc:
+            async def wait(self):
+                return 0
+
+            async def communicate(self):
+                return (b"", b"")
+
+        async def fake_exec(*args, **kwargs):
+            spawned.append(args)
+            return FakeProc()
+
+        with (
+            patch.object(load, "get_clients", fake_get_clients),
+            patch.object(load, "dispatch", fake_dispatch),
+            patch.object(load.asyncio, "sleep", fake_sleep),
+            patch.object(load, "client_commands", fake_client_commands),
+            patch.object(load.asyncio, "create_subprocess_exec", fake_exec),
+        ):
+            addr, fid = asyncio.run(
+                load.restore_window(saved, [], set(), force_spawn=True)
+            )
+
+        return events, spawned, addr
+
+    @staticmethod
+    def saved_step_window(at):
+        return {
+            "command": "app-two",
+            "class_name": "app-two",
+            "workspace_id": 3,
+            "is_floating": False,
+            "fullscreen": 0,
+            "focus_history_id": 7,
+            "at": at,
+            "size": [500, 500],
+            "match_command": "app-two",
+            "leaf_command": "",
+        }
+
+    @staticmethod
+    def live_client(address, at):
+        return {
+            "address": address,
+            "class": "app-two",
+            "mapped": True,
+            "workspace": {"id": 3},
+            "floating": False,
+            "fullscreen": 0,
+            "at": at,
+            "size": [500, 500],
+        }
+
+    def test_adopts_live_window_already_at_saved_placement(self):
+        saved = self.saved_step_window([500, 0])
+        live = self.live_client("live-app-two", [500, 0])
+
+        events, spawned, addr = self.run_force_restore(
+            saved, {"live-app-two": live}, {"live-app-two": ("app-two", "")}
+        )
+
+        self.assertEqual("live-app-two", addr)
+        self.assertEqual([], [event for event in events if event[0] == "closewindow"])
+        self.assertEqual([], spawned)
+
+    def test_replays_live_window_at_wrong_placement(self):
+        saved = self.saved_step_window([500, 0])
+        live = self.live_client("live-app-two", [0, 0])
+
+        events, spawned, addr = self.run_force_restore(
+            saved, {"live-app-two": live}, {"live-app-two": ("app-two", "")}
+        )
+
+        self.assertIn(("closewindow", "address:live-app-two"), events)
+        self.assertEqual(1, len(spawned))
+
+
 if __name__ == "__main__":
     unittest.main()
