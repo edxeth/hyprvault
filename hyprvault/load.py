@@ -22,11 +22,89 @@ from .utils import (
 )
 
 HYPR_V = 0.0
+# True when the running Hyprland uses the Lua config manager (hyprland.lua):
+# legacy dispatcher names are then parsed as Lua and fail. Probed once per
+# load in init_hypr_config().
+LUA_MANAGER = False
 # Enable restore tracing with HYPRVAULT_TRACE_ACTIONS=1.
 # Optional: override the log file path with HYPRVAULT_TRACE_PATH.
 TRACE_ENV_VAR = "HYPRVAULT_TRACE_ACTIONS"
 TRACE_ENABLED = os.environ.get(TRACE_ENV_VAR, "").lower() in {"1", "true", "yes", "on"}
 TRACE_PATH = Path(os.environ.get("HYPRVAULT_TRACE_PATH", "/tmp/hyprvault-action-trace.log"))
+
+
+def lua_escape(value: str) -> str:
+    """Escape a python string into a Lua double-quoted string literal."""
+    escaped = (
+        value.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n").replace("\r", "\\r")
+    )
+    return f'"{escaped}"'
+
+
+_LUA_DIRECTIONS = {"l": "left", "r": "right", "u": "up", "d": "down"}
+
+
+def to_lua_dispatch(cmd_args) -> str | None:
+    """Translate a legacy `hyprctl dispatch` tuple into a Lua dispatcher call.
+
+    Returns None for shapes this translator does not know; the caller then
+    falls back to the legacy form (and traces it).
+    """
+    name = cmd_args[0]
+    arg = cmd_args[1] if len(cmd_args) > 1 else None
+    if name == "focuswindow" and arg and arg.startswith("address:"):
+        return f"hl.dsp.focus({{ window = {lua_escape(arg)} }})"
+    if name == "fullscreen" and arg is not None:
+        # clients-JSON 2 (maximized) has no Lua mode of its own; 1 maximizes.
+        mode = {"0": "0", "1": "1", "2": "1"}.get(arg, "0")
+        return f'hl.dsp.window.fullscreen({{ mode = "{mode}", action = "set" }})'
+    if name == "setfloating" and arg and arg.startswith("address:"):
+        return f"hl.dsp.window.float({{ action = \"set\", window = {lua_escape(arg)} }})"
+    if name == "settiled" and arg and arg.startswith("address:"):
+        return f"hl.dsp.window.float({{ action = \"unset\", window = {lua_escape(arg)} }})"
+    if name == "resizewindowpixel" and arg:
+        geometry, address = arg.split(",", 1)
+        _, width, height = geometry.split(" ")
+        return f"hl.dsp.window.resize({{ x = {width}, y = {height}, window = {lua_escape(address)} }})"
+    if name == "movewindowpixel" and arg:
+        geometry, address = arg.split(",", 1)
+        _, x, y = geometry.split(" ")
+        return f"hl.dsp.window.move({{ x = {x}, y = {y}, window = {lua_escape(address)} }})"
+    if name == "movetoworkspacesilent" and arg:
+        ws_id, address = arg.split(",", 1)
+        return (
+            f"hl.dsp.window.move({{ workspace = {int(ws_id)}, "
+            f"window = {lua_escape(address)}, follow = false }})"
+        )
+    if name == "closewindow" and arg:
+        return f"hl.dsp.window.close({{ window = {lua_escape(arg)} }})"
+    if name == "workspace" and arg is not None:
+        return f"hl.dsp.focus({{ workspace = {int(arg)} }})"
+    if name == "layoutmsg" and arg is not None:
+        return f"hl.dsp.layout({lua_escape(arg)})"
+    if name == "moveoutofgroup" and arg:
+        return f"hl.dsp.window.move({{ out_of_group = true, window = {lua_escape(arg)} }})"
+    if name == "togglegroup":
+        return "hl.dsp.group.toggle()"
+    if name == "moveintogroup" and arg:
+        direction = _LUA_DIRECTIONS.get(arg, arg)
+        return f'hl.dsp.window.move({{ into_group = "{direction}" }})'
+    if name == "moveintoorcreategroup" and arg:
+        direction = _LUA_DIRECTIONS.get(arg, arg)
+        return f'hl.dsp.window.move({{ into_or_create_group = "{direction}" }})'
+    return None
+
+
+def to_lua_exec(cmd: str, ws_id: int, is_floating: bool, at, size) -> str:
+    """Lua form of the legacy `dispatch exec [workspace N silent;...] cmd`."""
+    fields = [f"workspace = {ws_id}", "no_initial_focus = true"]
+    if is_floating:
+        fields.append("float = true")
+        fields.append(f"move = \"{at[0]} {at[1]}\"")
+        fields.append(f"size = \"{size[0]} {size[1]}\"")
+    else:
+        fields.append("tile = true")
+    return f"hl.dsp.exec_cmd({lua_escape(cmd)}, {{ {', '.join(fields)} }})"
 
 
 def trace(message):
@@ -41,6 +119,21 @@ def trace(message):
 
 async def dispatch(cmd_args, wait=True):
     trace(f"dispatch wait={wait} args={cmd_args}")
+    if LUA_MANAGER:
+        lua_expr = to_lua_dispatch(cmd_args)
+        if lua_expr is not None:
+            trace(f"dispatch lua={lua_expr}")
+            proc = await asyncio.create_subprocess_exec(
+                "hyprctl",
+                "dispatch",
+                lua_expr,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            if wait:
+                return await proc.wait() == 0
+            return None
+        trace("dispatch lua translation missing, falling back to legacy form")
     proc = await asyncio.create_subprocess_exec(
         "hyprctl",
         "dispatch",
@@ -54,7 +147,7 @@ async def dispatch(cmd_args, wait=True):
 
 
 async def init_hypr_config():
-    global HYPR_V
+    global HYPR_V, LUA_MANAGER
     proc = await asyncio.create_subprocess_exec(
         "hyprctl", "version", "-j", stdout=asyncio.subprocess.PIPE
     )
@@ -65,6 +158,23 @@ async def init_hypr_config():
         HYPR_V = float(f"{v_parts[0]}.{v_parts[1]}")
     except Exception:
         HYPR_V = 0.0
+    # Config-manager probe: with the Lua manager (hyprland.lua) every
+    # `hyprctl dispatch <legacy-name> ...` is parsed as Lua and fails, so all
+    # dispatches must be translated (see to_lua_dispatch). Only a definitive
+    # probe answer selects Lua mode.
+    probe = await asyncio.create_subprocess_exec(
+        "hyprctl",
+        "eval",
+        "return 1",
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.STDOUT,
+    )
+    probe_out, _ = await probe.communicate()
+    LUA_MANAGER = (
+        probe.returncode == 0
+        and probe_out.decode("utf-8", "replace").strip() == "ok"
+    )
+    trace(f"config manager lua={LUA_MANAGER}")
 
 
 async def get_clients():
@@ -505,9 +615,22 @@ async def restore_window(sw, matchable_clients, used_addresses: set, force_spawn
         }
         trace(f"restore_window spawn class={sw.get('class_name')} ws={ws_id} force_spawn={force_spawn} cmd={cmd}")
         print(f"{YELLOW}[*]{RESET} Spawning new window: {cmd}")
-        proc = await asyncio.create_subprocess_exec(
-            "hyprctl", "dispatch", "exec", f"[{rules}]", cmd
-        )
+        if LUA_MANAGER:
+            lua_spawn = to_lua_exec(
+                cmd,
+                ws_id=ws_id,
+                is_floating=sw["is_floating"],
+                at=sw.get("at"),
+                size=sw.get("size"),
+            )
+            trace(f"restore_window spawn lua={lua_spawn}")
+            proc = await asyncio.create_subprocess_exec(
+                "hyprctl", "dispatch", lua_spawn
+            )
+        else:
+            proc = await asyncio.create_subprocess_exec(
+                "hyprctl", "dispatch", "exec", f"[{rules}]", cmd
+            )
         await proc.wait()
         if sw.get("class_name") == "Docker Desktop":
             spawned_match = await wait_for_spawned_class_window(
