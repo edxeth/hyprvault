@@ -164,9 +164,10 @@ def is_terminal_emulator(class_name: str) -> bool:
 
 
 def list_sessions() -> list[str]:
-    """List all saved session names."""
+    """List session names, most recently modified first."""
     config_dir = get_config_dir()
-    sessions = []
-    for f in config_dir.glob("*.json"):
-        sessions.append(f.stem)
-    return sorted(sessions)
+    sessions = sorted(
+        config_dir.glob("*.json"),
+        key=lambda f: (-f.stat().st_mtime, f.stem),
+    )
+    return [f.stem for f in sessions]
