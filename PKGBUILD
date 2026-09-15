@@ -1,6 +1,6 @@
 # Maintainer: Tunahanyrd <tunahanyrd@gmail.com>
 pkgname=hyprvault
-pkgver=0.1.0
+pkgver=1.0.0
 pkgrel=1
 pkgdesc="Lightweight session manager for Hyprland"
 arch=('any')
